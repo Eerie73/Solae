@@ -31,8 +31,7 @@ pip install -r requirements.txt
 ```
 
 Install an Ollama model:
-Suggested chat model: llama3.2:3b
-suggested monitoring model: mistral:7b
+
 ```bash
 ollama pull <model>
 ```
@@ -43,7 +42,7 @@ For example:
 ollama pull llama3.2:3b
 ```
 
-```bash
+```text
 Suggested model for chat & monitor: lama3.2:3b
 ```
 
