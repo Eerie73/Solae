@@ -14,6 +14,7 @@ from . import config
 from . import moderation_rules
 from . import reports
 from . import state as state_store
+from .ai import ModerationUnavailable
 
 
 def channel_is_monitorable(channel, me):
@@ -80,7 +81,29 @@ async def _handle_flagged(message, result):
 async def process_message(ai, message, mark_processed=True):
     """Runs a single message through moderation analysis (if eligible)
     and acts on it if flagged. Used for both live messages and
-    backfilled history."""
+    backfilled history.
+
+    Returns a short status string for the caller to tally up:
+      "flagged"    - newly flagged, report/actions were run
+      "duplicate"  - flagged, but this exact message ID was already
+                     flagged before (by ID) - no duplicate action taken
+      "scanned"    - analyzed, came back clean
+      "skipped"    - not eligible / didn't need analysis
+      "retry"      - the moderation AI was unreachable; NOT marked as
+                     processed, so it will be picked up again on the
+                     next backfill/rescan instead of slipping through
+      "error"      - unexpected error; also not marked as processed
+
+    IMPORTANT: the message is only marked as "processed" (its ID
+    advances the channel's scan cursor) when we actually managed to
+    analyze it. This is what makes the 12h backfill self-healing if
+    the AI backend is briefly unreachable - previously, any failure
+    was still marked done, so those messages were silently never
+    re-checked even after the AI came back up.
+    """
+    should_retry = False
+    status = "skipped"
+
     try:
         eligible = (
             config.MONITORING_ENABLED
@@ -97,16 +120,40 @@ async def process_message(ai, message, mark_processed=True):
             )
 
             if _should_analyze(content, attachment_names):
-                result = await ai.analyze_message(content, attachment_names)
-                if result.get("flagged"):
-                    await _handle_flagged(message, result)
+                try:
+                    result = await ai.analyze_message(content, attachment_names)
+                except ModerationUnavailable as e:
+                    should_retry = True
+                    status = "retry"
+                    print(
+                        f"[monitor] moderation AI unreachable ({e}) - "
+                        f"message {message.id} in #{message.channel} will be "
+                        f"retried on the next scan, not marked as checked"
+                    )
+                else:
+                    status = "scanned"
+                    if result.get("flagged"):
+                        # Message-ID based dedupe: guarantees this exact
+                        # message is never flagged/reported/deleted twice,
+                        # even across restarts, regardless of the scan
+                        # cursor above.
+                        if state_store.is_already_flagged(message.id):
+                            status = "duplicate"
+                        else:
+                            state_store.mark_flagged(message.id)
+                            await _handle_flagged(message, result)
+                            status = "flagged"
 
     except Exception as e:
+        should_retry = True
+        status = "error"
         print(f"[monitor] error processing message {message.id}: {e}")
 
     finally:
-        if mark_processed and message.guild is not None:
+        if mark_processed and not should_retry and message.guild is not None:
             state_store.set_last_processed(message.channel.id, message.id)
+
+    return status
 
 
 async def _channel_after_bound(channel, cutoff):
@@ -123,9 +170,14 @@ async def _channel_after_bound(channel, cutoff):
     return cutoff, last_id
 
 
+def _new_stats():
+    return {"channels": 0, "scanned": 0, "flagged": 0, "duplicate": 0, "retry": 0}
+
+
 async def backfill_guild(ai, guild):
     me = guild.me
     cutoff = discord.utils.utcnow() - datetime.timedelta(hours=config.BACKFILL_HOURS)
+    stats = _new_stats()
 
     channels = list(guild.text_channels)
     if config.MONITOR_THREADS:
@@ -135,6 +187,7 @@ async def backfill_guild(ai, guild):
         if not channel_is_monitorable(channel, me):
             continue
 
+        stats["channels"] += 1
         after, last_id = await _channel_after_bound(channel, cutoff)
 
         try:
@@ -143,7 +196,9 @@ async def backfill_guild(ai, guild):
             ):
                 if last_id is not None and message.id == last_id:
                     continue
-                await process_message(ai, message)
+                status = await process_message(ai, message)
+                if status in stats:
+                    stats[status] += 1
 
         except discord.Forbidden:
             continue
@@ -151,22 +206,39 @@ async def backfill_guild(ai, guild):
             print(f"[monitor] could not read history for #{channel}: {e}")
             continue
 
+    return stats
+
 
 async def run_backfill(client, ai):
+    totals = _new_stats()
+    totals["guilds"] = 0
+
     for guild in client.guilds:
-        await backfill_guild(ai, guild)
-    print("[monitor] scan complete")
+        stats = await backfill_guild(ai, guild)
+        totals["guilds"] += 1
+        for key, value in stats.items():
+            totals[key] = totals.get(key, 0) + value
+
+    return totals
 
 
 async def live_rescan_loop(client, ai):
     """Safety net in case a brief disconnect causes on_message to miss
-    something. Already-processed messages are always skipped, so this
-    never creates duplicate reports."""
+    something. Already-processed messages are always skipped (by scan
+    cursor), and already-flagged messages are never acted on twice
+    (by message ID), so this never creates duplicate reports."""
     await client.wait_until_ready()
 
     while not client.is_closed():
         await asyncio.sleep(config.LIVE_RESCAN_INTERVAL_SECONDS)
         try:
-            await run_backfill(client, ai)
+            totals = await run_backfill(client, ai)
+            if totals["scanned"] or totals["flagged"] or totals["retry"]:
+                print(
+                    f"[monitor] rescan: {totals['scanned']} scanned, "
+                    f"{totals['flagged']} flagged"
+                    + (f", {totals['retry']} pending retry (AI unreachable)"
+                       if totals["retry"] else "")
+                )
         except Exception as e:
             print(f"[monitor] rescan error: {e}")

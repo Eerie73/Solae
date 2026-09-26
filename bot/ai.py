@@ -53,6 +53,73 @@ def _build_moderation_prompt():
 DEFAULT_ANALYSIS = {"flagged": False, "category": None, "flags": [], "reason": ""}
 
 
+class ModerationUnavailable(Exception):
+    """Raised when the moderation AI backend (Ollama) could not be
+    reached or errored out, as opposed to it successfully responding
+    with "not flagged". monitor.py deliberately treats this
+    differently from a real "not flagged" result: a message must NOT
+    be marked as scanned if we never actually got to analyze it, or
+    it would silently slip through moderation forever (this was the
+    cause of the "past 12h scan doesn't catch anything" bug - every
+    message was being marked done even when Ollama was unreachable)."""
+
+
+# ---------------------------------------------------------------
+# Word whitelist (config.WHITELIST_WORDS) - never flag these
+# ---------------------------------------------------------------
+def _normalize(text):
+    return re.sub(r"[^\w\s]", "", (text or "").lower()).strip()
+
+
+def _strip_whitelisted_words(text):
+    remaining = text or ""
+    for raw_word in config.WHITELIST_WORDS:
+        word = (raw_word or "").strip()
+        if not word:
+            continue
+        remaining = re.sub(r"(?i)\b" + re.escape(word) + r"\b", "", remaining)
+    return remaining
+
+
+def _message_is_fully_whitelisted(text):
+    """True if, once every whitelisted word/phrase is stripped out,
+    nothing meaningful is left - i.e. the message is made up entirely
+    of whitelisted words (+ punctuation/whitespace). Lets us skip the
+    AI call entirely for the common case (someone just says a
+    whitelisted word on its own)."""
+    if not config.WHITELIST_WORDS:
+        return False
+    if not _normalize(text):
+        return False
+    return _normalize(_strip_whitelisted_words(text)) == ""
+
+
+def _flag_is_whitelisted(flag_text):
+    normalized = _normalize(flag_text)
+    if not normalized:
+        return False
+    return any(
+        normalized == _normalize(word)
+        for word in config.WHITELIST_WORDS
+        if _normalize(word)
+    )
+
+
+def _apply_whitelist(result):
+    """Second safety net: even for mixed-content messages that do go
+    to the AI, if every trigger word/phrase the AI itself flagged is
+    whitelisted, suppress the flag."""
+    if not result.get("flagged"):
+        return result
+
+    flags = result.get("flags") or []
+    if flags and all(_flag_is_whitelisted(f) for f in flags):
+        print(f"[ai] flag suppressed - all trigger words are whitelisted: {flags}")
+        return dict(DEFAULT_ANALYSIS)
+
+    return result
+
+
 class AI:
     def __init__(self):
         self.conversations = {}
@@ -77,9 +144,11 @@ class AI:
             "model": model,
             "messages": messages,
             "stream": False,
+            "keep_alive": config.OLLAMA_KEEP_ALIVE,
         }
 
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=config.OLLAMA_REQUEST_TIMEOUT_SECONDS)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(
                 f"{config.OLLAMA_URL}/api/chat",
                 json=payload,
@@ -117,12 +186,23 @@ class AI:
         """
         Returns a dict:
           {"flagged": bool, "category": str|None, "flags": [...], "reason": str}
-        Never raises for parsing issues - falls back to "not flagged".
+        Never raises for PARSING issues (bad/garbled model output) -
+        those fall back to "not flagged", same as before.
+
+        DOES raise ModerationUnavailable if the AI backend itself
+        couldn't be reached/errored, so the caller can retry the
+        message later instead of treating "couldn't check" the same
+        as "checked, and it's clean".
         """
         text = content or ""
         if attachment_names:
             text += "\n[Attachments: " + ", ".join(attachment_names) + "]"
         if not text.strip():
+            return dict(DEFAULT_ANALYSIS)
+
+        # Fast path: message is nothing but whitelisted word(s) - skip
+        # the AI call entirely (attachments still always get analyzed).
+        if not attachment_names and _message_is_fully_whitelisted(content or ""):
             return dict(DEFAULT_ANALYSIS)
 
         messages = [
@@ -133,8 +213,11 @@ class AI:
         try:
             raw = await self._call_ollama(config.MODERATION_MODEL, messages)
         except Exception as e:
-            print(f"[ai] moderation call failed: {e}")
-            return dict(DEFAULT_ANALYSIS)
+            # IMPORTANT: this must propagate, not swallow-and-return
+            # "not flagged" - otherwise an offline/unreachable Ollama
+            # server causes every message to be silently marked as
+            # scanned without ever really being checked.
+            raise ModerationUnavailable(str(e)) from e
 
         cleaned = _strip_think(raw)
         match = JSON_OBJECT_RE.search(cleaned)
@@ -146,9 +229,29 @@ class AI:
         except json.JSONDecodeError:
             return dict(DEFAULT_ANALYSIS)
 
-        return {
+        result = {
             "flagged": bool(result.get("flagged", False)),
             "category": result.get("category"),
             "flags": result.get("flags") or [],
             "reason": result.get("reason") or "",
         }
+
+        return _apply_whitelist(result)
+
+    # ---------------------------------------------------------------
+    # Startup diagnostics only - checks whether Ollama is reachable
+    # and what models it has, used for the terminal banner.
+    # ---------------------------------------------------------------
+    async def check_ollama_connection(self):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{config.OLLAMA_URL}/api/tags",
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as response:
+                    response.raise_for_status()
+                    data = await response.json()
+            models = sorted(m.get("name", "?") for m in data.get("models", []))
+            return True, models
+        except Exception as e:
+            return False, str(e)

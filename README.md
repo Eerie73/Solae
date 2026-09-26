@@ -43,6 +43,10 @@ For example:
 ollama pull llama3.2:3b
 ```
 
+```bash
+Suggested model for chat & monitor: lama3.2:3b
+```
+
 Start Ollama:
 
 ```bash
@@ -179,7 +183,8 @@ Message Edited: False
 - The startup/backfill message scanner is currently not working correctly and may be fixed or removed in a future update.
 - Only active threads are scanned when thread monitoring is enabled.
 - The bot does not require the Members intent for its current functionality.
-- ⚠️ Startup history scanning is currently unavailable and will be fixed or removed in a future update.
+- Startup history scanning is now available.
+- Use one model for both chat and monitor for consistency.
 
 ## Local & Open Source
 

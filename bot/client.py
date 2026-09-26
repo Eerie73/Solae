@@ -73,15 +73,116 @@ async def _is_reply_to_bot(message):
     return resolved is not None and resolved.author.id == client.user.id
 
 
+class _C:
+    """Minimal ANSI helpers. If a terminal doesn't support color the
+    codes just render as a no-op-ish sequence; nothing here is load
+    bearing for functionality."""
+    R = "\033[0m"
+    B = "\033[1m"
+    DIM = "\033[2m"
+    GREEN = "\033[32m"
+    RED = "\033[31m"
+    YELLOW = "\033[33m"
+    CYAN = "\033[36m"
+
+
+def _rule(char="─", width=64):
+    print(f"{_C.DIM}{char * width}{_C.R}")
+
+
+def _count_monitorable_channels(guild):
+    me = guild.me
+    if me is None:
+        return 0, 0
+
+    text_count = sum(
+        1 for c in guild.text_channels if monitor.channel_is_monitorable(c, me)
+    )
+    thread_count = 0
+    if config.MONITOR_THREADS:
+        thread_count = sum(
+            1 for t in guild.threads if monitor.channel_is_monitorable(t, me)
+        )
+    return text_count, thread_count
+
+
 @client.event
 async def on_ready():
-    print(f"Logged in as {client.user}")
-    print(f"[monitor] running startup backfill (last {config.BACKFILL_HOURS}h)...")
+    _rule("═")
+    print(f"{_C.B}{_C.CYAN}Solae{_C.R} — Discord monitor + chat bot")
+    _rule("═")
+    print(f"  Logged in as   : {_C.B}{client.user}{_C.R} (id: {client.user.id})")
+    print(f"  Guilds         : {len(client.guilds)}")
 
-    await monitor.run_backfill(client, ai)
+    total_text, total_threads = 0, 0
+    for guild in client.guilds:
+        t, th = _count_monitorable_channels(guild)
+        total_text += t
+        total_threads += th
+    print(
+        f"  Monitorable    : {total_text} text channel(s), "
+        f"{total_threads} thread(s)"
+    )
+
+    mod_ok, mod_detail = await ai.check_ollama_connection()
+    if mod_ok:
+        models = ", ".join(mod_detail) if mod_detail else "(no models pulled)"
+        print(f"  Ollama         : {_C.GREEN}reachable{_C.R} @ {config.OLLAMA_URL}")
+        print(f"  Models on host : {models}")
+        if config.MODERATION_MODEL not in (mod_detail or []):
+            print(
+                f"  {_C.YELLOW}⚠ moderation model '{config.MODERATION_MODEL}' "
+                f"not found on the Ollama host - pull it or moderation "
+                f"calls will fail{_C.R}"
+            )
+    else:
+        print(f"  Ollama         : {_C.RED}unreachable{_C.R} ({mod_detail})")
+        print(
+            f"  {_C.YELLOW}⚠ moderation is effectively paused until Ollama "
+            f"is reachable - affected messages will retry automatically, "
+            f"nothing is lost or skipped{_C.R}"
+        )
+
+    print(
+        f"  Monitoring     : "
+        f"{_C.GREEN + 'enabled' if config.MONITORING_ENABLED else _C.RED + 'disabled'}{_C.R}"
+        f"  |  backfill window: last {config.BACKFILL_HOURS}h"
+        f"  |  rescan every {config.LIVE_RESCAN_INTERVAL_SECONDS}s"
+    )
+    print(
+        f"  Actions        : create_report={config.ACTIONS.get('create_report')}"
+        f"  delete_message={config.ACTIONS.get('delete_message')}"
+        f"  notify_mod_channel={config.ACTIONS.get('notify_mod_channel')}"
+    )
+    whitelist_count = len([w for w in config.WHITELIST_WORDS if w and w.strip()])
+    print(f"  Whitelist words: {whitelist_count} configured")
+    print(
+        f"  Chat triggers  : mention={config.RESPOND_ON_MENTION}"
+        f"  reply-to-bot={config.RESPOND_ON_REPLY_TO_BOT}"
+        f"  dm={config.ALLOW_DM_CHAT}"
+    )
+    _rule("═")
+
+    print(f"  Running startup backfill (last {config.BACKFILL_HOURS}h)...")
+    totals = await monitor.run_backfill(client, ai)
+    summary = (
+        f"  {_C.GREEN}✔{_C.R} Backfill complete — "
+        f"{totals['scanned']} scanned, {totals['flagged']} flagged"
+    )
+    if totals.get("duplicate"):
+        summary += f", {totals['duplicate']} duplicate flag(s) skipped"
+    if totals.get("retry"):
+        summary += (
+            f", {_C.YELLOW}{totals['retry']} pending retry "
+            f"(AI was unreachable){_C.R}"
+        )
+    print(summary)
+
     client.loop.create_task(monitor.live_rescan_loop(client, ai))
 
-    print("Discord monitor bot is ready.")
+    _rule("═")
+    print(f"  {_C.B}{_C.GREEN}Solae is online and monitoring.{_C.R}")
+    _rule("═")
 
 
 @client.event
@@ -92,9 +193,17 @@ async def on_message(message):
     # ---------------------------------------------------------------
     # Monitoring - runs independently of chat, on every eligible
     # guild message, never sends anything to the channel by itself.
+    #
+    # Fired as a background task instead of awaited: process_message
+    # already catches and logs all of its own exceptions internally,
+    # so it's safe to fire-and-forget. Previously this was awaited
+    # here, which meant EVERY chat reply had to wait for a full
+    # moderation-model call (a separate, much larger model) to finish
+    # first - doubling latency and forcing Ollama to swap models back
+    # and forth on every single message.
     # ---------------------------------------------------------------
     if message.guild is not None:
-        await monitor.process_message(ai, message)
+        client.loop.create_task(monitor.process_message(ai, message))
 
     # ---------------------------------------------------------------
     # Chat - only ever triggers on mention / reply-to-bot (or DMs)

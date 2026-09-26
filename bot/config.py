@@ -9,7 +9,7 @@
 # =====================================================================
 # DISCORD BOT TOKEN  <-- put your token here
 # =====================================================================
-DISCORD_BOT_TOKEN = "bot_token"
+DISCORD_BOT_TOKEN = "your_bot_token"
 
 # =====================================================================
 # AI / OLLAMA SETTINGS
@@ -22,7 +22,38 @@ CHAT_MODEL = "llama3.2:3b"
 
 # Model used for background message moderation/analysis.
 # Can be the same model or a different one.
-MODERATION_MODEL = "mistral:7b"
+#
+# NOTE: if this is a DIFFERENT model than CHAT_MODEL (as it is by
+# default), Ollama has to swap models in/out of memory every time it
+# switches between answering a chat message and analyzing one for
+# moderation - this is by far the biggest source of slow replies.
+# deepseek-r1 is also a "thinking" model, so it's slow to generate on
+# top of the swap cost. Two ways to fix this, pick one:
+#
+#   1. (fastest fix) Set this to the same value as CHAT_MODEL, e.g.
+#      MODERATION_MODEL = "llama3.2:3b" - no more swapping at all.
+#
+#   2. Keep a bigger/different moderation model, but tell the Ollama
+#      SERVER to keep multiple models loaded at once, so it stops
+#      evicting one to load the other. Launch Ollama with:
+#          OLLAMA_MAX_LOADED_MODELS=2 ollama serve
+#      (needs enough free RAM/VRAM to hold both models at the same
+#      time - roughly the sum of both models' sizes). OLLAMA_KEEP_ALIVE
+#      below also helps by keeping whichever model was just used
+#      resident longer instead of unloading it after 5 minutes idle.
+MODERATION_MODEL = "llama3.2:3b"
+
+# How long Ollama should keep a model loaded in memory after a request
+# before unloading it (Ollama's own default is "5m"). Raising this
+# reduces reload stalls if there's ever a gap between messages. Use
+# "-1" to keep it loaded forever, or "0" to unload immediately after
+# each request (not recommended - forces a reload every time).
+OLLAMA_KEEP_ALIVE = "30m"
+
+# Safety net so a stuck/overloaded Ollama call fails with a clear
+# error instead of hanging indefinitely (aiohttp has no timeout by
+# default).
+OLLAMA_REQUEST_TIMEOUT_SECONDS = 120
 
 # How many past user/assistant turns to remember per conversation
 MAX_HISTORY = 20
@@ -487,7 +518,7 @@ ALLOW_DM_CHAT = False
 # allowed/banned here), not just generic categories. Leave empty ("")
 # to skip - the bot will fall back to the categories alone.
 SERVER_RULES = """
-Everything should be SFW.
+Everything should be SFW
 """
 
 # =====================================================================
@@ -497,7 +528,7 @@ MONITORING_ENABLED = True
 
 # On startup / reconnect, look back this many hours and analyze
 # anything that was missed while the bot was offline.
-BACKFILL_HOURS = None #has bugs/doesn't work for now
+BACKFILL_HOURS = 8
 
 # Channel IDs the bot should NEVER read or analyze, even if it can
 # technically view them. Right-click a channel -> Copy Channel ID
@@ -523,6 +554,28 @@ ANALYZE_ATTACHMENT_NAMES = True
 MONITOR_THREADS = True
 
 # =====================================================================
+# WORD WHITELIST
+# =====================================================================
+# Words/phrases the bot should NEVER flag, even if they'd otherwise
+# trip a category above - useful for inside jokes, gaming terms,
+# names, or anything that looks suspicious out of context but is fine
+# in your server. Case-insensitive, whole-word matched.
+#
+# This is intentionally conservative about when it suppresses a flag:
+#   - If a message is made up ENTIRELY of whitelisted word(s) (plus
+#     punctuation/spacing), it's never even sent to the AI.
+#   - If a mixed message does go to the AI and comes back flagged,
+#     the flag is only suppressed if EVERY trigger word/phrase the AI
+#     itself identified is whitelisted. A whitelisted word sitting
+#     next to genuinely bad content will NOT save that message.
+#
+# Example: WHITELIST_WORDS = ["noob", "kill", "simp"]
+WHITELIST_WORDS = [
+    "owo"
+    "uwu"
+]
+
+# =====================================================================
 # ACTIONS - what happens once a message is flagged as inappropriate
 # =====================================================================
 ACTIONS = {
@@ -537,7 +590,6 @@ ACTIONS = {
 
     # Post a short notice in a mod-only channel when something is
     # flagged. Set MOD_LOG_CHANNEL_ID below and flip this to True.
-    # recommended to leave false
     "notify_mod_channel": False,
 }
 
@@ -552,7 +604,6 @@ JSON_DIR = "json"
 
 # Timezone used for report file dates & the "Message Sent Time" field.
 # Any IANA name, e.g. "UTC", "Asia/Dhaka", "America/New_York".
-# Bot may not work if it fails to recognize the timezone name.
 TIMEZONE = "UTC"
 
 # Month abbreviations used in report file names (report-<uid>-<mon>-<day>)
