@@ -179,7 +179,7 @@ Message Edited: False
 
 - The AI currently receives attachment **file names**, not the actual image or video content.
 - Moderation accuracy depends on the Ollama model being used.
-- The startup/backfill message scanner is currently not working correctly and may be fixed or removed in a future update.
+- The startup/backfill message scanner is now working correctly.
 - Only active threads are scanned when thread monitoring is enabled.
 - The bot does not require the Members intent for its current functionality.
 - Startup history scanning is now available.
